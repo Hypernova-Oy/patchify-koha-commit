@@ -10,15 +10,59 @@ my $input_file;
 my $output_file;
 my $output_dir;
 my $commit_id;
+my $commit_format = 'debian';
+my $translateDebian2Git;
 my $verbose;
+my $help;
+
+# Append the mapping to these .patch-file lookups
+my @replacementLookups = (
+    '^ create mode \d{6} \K',
+    '^\-\-\- a\/\K',
+    '^\+\+\+ b\/\K',
+    '^diff --git a\/\K',
+    '^diff --git a\/.+? b\/\K',
+);
 
 GetOptions(
     "i|input=s"  => \$input_file,
     "o|output=s" => \$output_file,
     "d|output_dir=s" => \$output_dir,
     "c|commit=s" => \$commit_id,
+    "f|format=s" => \$commit_format,
     "verbose"    => \$verbose,
+    "h|help"     => \$help,
 ) or die("Error in command line arguments\n");
+
+if ($help) {
+    print <<HELP;
+$0 [OPTIONS]
+
+Convert a git-derived Koha patch into a patch that can be applied to a server 
+running a Debian package install of Koha or vice-versa.
+
+Some limitations apply, such as debian-packaged file hierarchy doesn't support 
+changes to /etc/koha-conf.xml or test files etc.
+
+OPTIONS:
+  -i, --input FILE        Input patch file to process
+  -o, --output FILE       Output patch file (if not specified, prints to stdout)
+  -d, --output_dir DIR    Directory to write output files to
+  -c, --commit ID         Git commit ID to process
+  -f  --format FORMAT     deb - Translate from Git to Debian format
+                          git - Translate from Debian to Git
+                          default - debian
+      --verbose           Enable verbose output
+  -h, --help              Show this help message
+
+EXAMPLES:
+  $0 -i patch.patch -o converted.patch
+  $0 --input my.patch --output_dir /tmp --verbose
+  $0 --commit abc123def --d2g
+
+HELP
+    exit(0);
+}
 
 unless ($commit_id) {
     unless ($input_file) {
@@ -40,53 +84,145 @@ if ($commit_id) {
 
     $input_file = $cmd;
     chomp $input_file;
-    $output_file = $input_file;
+    $output_file = $input_file unless $output_file;
 }
 
+print "read_file $input_file\n" if ($verbose);
 my @lines = read_file($input_file);
 
-my $mapping = {
-    'b/C4/' => '/usr/share/koha/lib/C4/',
-    'b/Koha/' => '/usr/share/koha/lib/Koha/',
-    'b/admin/' => '/usr/share/koha/intranet/cgi-bin/admin/',
-    'b/errors/' => '/usr/share/koha/intranet/cgi-bin/errors/',
-    'b/suggestion/' => '/usr/share/koha/intranet/cgi-bin/suggestion/',
-    'b/installer/' => '/usr/share/koha/intranet/cgi-bin/installer/',
-    'b/acqui/' => '/usr/share/koha/intranet/cgi-bin/acqui/',
-    'b/opac/' => '/usr/share/koha/opac/cgi-bin/opac/',
-    'b/misc/' => '/usr/share/koha/bin/',
-    'b/tools/' => '/usr/share/koha/intranet/cgi-bin/tools/',
-    'b/members/' => '/usr/share/koha/intranet/cgi-bin/members/',
-    'b/koha-tmpl/intranet-tmpl/' => '/usr/share/koha/intranet/htdocs/intranet-tmpl/',
-    'b/koha-tmpl/opac-tmpl/' => '/usr/share/koha/opac/htdocs/opac-tmpl/',
-    'b/catalogue/' => '/usr/share/koha/intranet/cgi-bin/catalogue/',
-    'b/t/'  => '/tmp/',
-    'b/debian/scripts/' => '/usr/sbin/',
-    'b/etc/' => '/etc/koha/',
-    'b/reserve/' => '/usr/share/koha/intranet/cgi-bin/reserve/',
-    'b/api/' => '/usr/share/koha/api/',
-    'b/circ/' => '/usr/share/koha/intranet/cgi-bin/circ/',
-    'b/cataloguing' => '/usr/share/koha/intranet/cgi-bin/cataloguing/',
-    'b/virtualshelves' => '/usr/share/koha/intranet/cgi-bin/virtualshelves/',
-    'b/pos' => '/usr/share/koha/intranet/cgi-bin/pos/',
-    'b/svc/' => '/usr/share/koha/intranet/cgi-bin/svc/',
-    'b/bookings/' => '/usr/share/koha/intranet/cgi-bin/bookings/',
-    'b/reports/' => '/usr/share/koha/intranet/cgi-bin/reports/'
-};
+my @mappingGit2Debian = ( # Use arrays, so we preserve the processing order.
+    # Specific files first
+    ['about.pl' => 'intranet/cgi-bin/about.pl'],
+    ['changelanguage.pl' => 'intranet/cgi-bin/changelanguage.pl'],
+    ['help.pl' => 'intranet/cgi-bin/help.pl'],
+    ['kohaversion.pl' => 'intranet/cgi-bin/kohaversion.pl'],
+    ['mainpage.pl' => 'intranet/cgi-bin/mainpage.pl'],
 
-my $b_line = qr/^\+\+\+ b\//;
+    # Template directories
+    ['koha-tmpl/intranet-tmpl/' => 'intranet/htdocs/intranet-tmpl/'],
+    ['koha-tmpl/opac-tmpl/' => 'opac/htdocs/opac-tmpl/'],
 
-foreach my $line (@lines) {
-    if ( $line =~ m/$b_line/ ) {    # match on
-        print "FOUND LINE: $line" if $verbose;
+    # Library directories
+    ['C4/' => 'lib/C4/'],
+    ['Koha/' => 'lib/Koha/'],
 
-        foreach my $from ( keys %$mapping ) {
-            my $to = $mapping->{$from};
-            $line =~ s/$from/$to/;
+    # CGI directories
+    ['admin/' => 'intranet/cgi-bin/admin/'],
+    ['errors/' => 'intranet/cgi-bin/errors/'],
+    ['suggestion/' => 'intranet/cgi-bin/suggestion/'],
+    ['installer/' => 'intranet/cgi-bin/installer/'],
+    ['acqui/' => 'intranet/cgi-bin/acqui/'],
+    ['tools/' => 'intranet/cgi-bin/tools/'],
+    ['members/' => 'intranet/cgi-bin/members/'],
+    ['catalogue/' => 'intranet/cgi-bin/catalogue/'],
+    ['reserve/' => 'intranet/cgi-bin/reserve/'],
+    ['circ/' => 'intranet/cgi-bin/circ/'],
+    ['cataloguing/' => 'intranet/cgi-bin/cataloguing/'],
+    ['virtualshelves/' => 'intranet/cgi-bin/virtualshelves/'],
+    ['pos/' => 'intranet/cgi-bin/pos/'],
+    ['svc/' => 'intranet/cgi-bin/svc/'],
+    ['bookings/' => 'intranet/cgi-bin/bookings/'],
+    ['reports/' => 'intranet/cgi-bin/reports/'],
+
+    # OPAC
+    ['opac/' => 'opac/cgi-bin/opac/'],
+
+    # System directories
+    ['misc/' => 'bin/'],
+    ['t/' => '/tmp/'],
+    ['debian/scripts/' => '/usr/sbin/'],
+    ['etc/' => '/etc/koha/'],
+
+    # API (no change)
+    ['api/' => 'api/'],
+);
+my @mappingDebian2Git = map { [$_->[1] => $_->[0]] } @mappingGit2Debian;
+push(@mappingDebian2Git, ['intranet/cgi-bin/' => '']);
+
+my @mappingNone;
+
+my $mapping;
+
+for (my $i=0 ; $i<@lines ; $i++) {
+    for my $lookup (@replacementLookups) {
+        if ( $lines[$i] =~ m/$lookup/ ) {    # match on
+            print "FOUND LINE: $lines[$i]" if $verbose;
+
+            detectFormat($lookup, \@lines, $i); #sets $mapping;
+
+            my $mappingFound = 0;
+            if ($commit_format =~ /^deb/i) {
+                if ($mapping == \@mappingGit2Debian) {
+                    $mappingFound = translateLine($lookup,  \@lines, $i)
+                }
+                else {
+                    #print "Format is already debian\n";
+                    $mappingFound = 1;
+                }
+            }
+            elsif ($commit_format =~ /^git/i) {
+                if ($mapping == \@mappingDebian2Git) {
+                    $mappingFound = translateLine($lookup,  \@lines, $i)
+                }
+                else {
+                    #print "Format is already git\n";
+                    $mappingFound = 1;
+                }
+            }
+            print "NO MAPPING FOUND FOR $lines[$i]" unless ($mappingFound);
         }
-
-        print "NO MAPPING FOUND FOR $line" if $line =~ m/$b_line/;
     }
 }
 
+print "write_file $output_file\n" if ($verbose);
 write_file( $output_file, @lines );
+
+sub detectFormat {
+    my ($lookup, $lines, $i) = @_;
+    # Detect the mapping, git => debian vs debian => git.
+    # Looks like the mappings can be confused, besides the static path portions, so check defensively.
+    # Debian-style paths are more unique, so check for debianness first.
+    foreach my $debian2Git (@mappingDebian2Git) {
+        my ($from, $to) = @$debian2Git;
+        if ($lines->[$i] =~ m/$lookup$from/) {
+            if ($from eq $to && not($mapping)) { # b/api/ => b/api/
+                $mapping = \@mappingNone;
+            }
+            elsif (not($mapping)) {
+                $mapping = \@mappingDebian2Git;
+            }
+            elsif ($mapping != \@mappingDebian2Git && not($mapping == \@mappingNone)) {
+                warn "Previous mapping changed to 'debian2Git' at line '$lines->[$i]' matching rule '$from => $to'";
+                $mapping = \@mappingDebian2Git;
+            }
+        }
+    }
+    if (not($mapping)) {
+        foreach my $git2Debian (@mappingGit2Debian) {
+            my ($from, $to) = @$git2Debian;
+            if ($lines->[$i] =~ m/$lookup$from/) {
+                if ($from eq $to && not($mapping)) { # b/api/ => b/api/
+                    $mapping = \@mappingNone;
+                }
+                if (not($mapping)) {
+                    $mapping = \@mappingGit2Debian;
+                }
+                elsif ($mapping != \@mappingGit2Debian && not($mapping == \@mappingNone)) {
+                    warn "Previous mapping changed to 'git2Debian' at line '$lines->[$i]' matching rule '$from => $to'";
+                    $mapping = \@mappingGit2Debian;
+                }
+            }
+        }
+    }
+}
+
+sub translateLine {
+    my ($lookup, $lines, $i) = @_;
+
+    foreach my $m (@$mapping) {
+        my ($from, $to) = @$m;
+        if ($lines[$i] =~ s/$lookup$from/$to/) {
+            return 1;
+        }
+    }
+}
